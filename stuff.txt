@@ -1,0 +1,215 @@
+class CLIPTextEncoder(nn.Module):
+    """Wrapper around CLIP text encoder for diffusion conditioning.
+    
+    Clip effectively maps images and text to the same latent space.
+    
+    """
+
+    def __init__(self, model_name="openai/clip-vit-base-patch32", freeze=True):
+        super().__init__()
+        self.tokenizer = CLIPTokenizer.from_pretrained(model_name)
+        self.text_model = CLIPTextModel.from_pretrained(model_name)
+
+        if freeze:
+            for param in self.text_model.parameters():
+                param.requires_grad = False
+
+        self.embedding_dim = self.text_model.config.hidden_size  # 512 for base model
+
+    def forward(self, text_prompts):
+        """
+        Encode text prompts to embeddings.
+
+        Args:
+            text_prompts: List of strings or single string
+
+        Returns:
+            Text embeddings of shape [batch_size, embedding_dim]
+        """
+        if isinstance(text_prompts, str):
+            text_prompts = [text_prompts]
+
+        tokens = self.tokenizer(
+            text_prompts,
+            padding=True,
+            truncation=True,
+            max_length=77,
+            return_tensors="pt"
+        ).to(self.text_model.device)
+
+        with torch.set_grad_enabled(self.text_model.training):
+            outputs = self.text_model(**tokens)
+            embeddings = outputs.pooler_output  # [batch_size, 512]
+
+        return embeddings
+
+
+class TimeEmbedding(nn.Module):
+    """Sinusoidal time embedding."""
+
+def __init__(self, dim):
+        super().__init__()
+        self.dim = dim
+    def forward(self, t):
+        half_dim = self.dim // 2
+        emb = math.log(10000) / (half_dim - 1)
+        emb = torch.exp(torch.arange(half_dim, device=t.device) * -emb)
+        emb = t[:, None] * emb[None, :]
+        return torch.cat([emb.sin(), emb.cos()], dim=1)
+
+class ResBlock(nn.Module):
+    """Residual block with time and text conditioning."""
+
+    def __init__(self, in_ch, out_ch, time_dim, text_dim=None):
+        super().__init__()
+        self.time_mlp = nn.Linear(time_dim, out_ch)
+        self.text_mlp = nn.Linear(text_dim, out_ch) if text_dim else None
+
+        self.conv1 = nn.Conv2d(in_ch, out_ch, 3, padding=1)
+        self.conv2 = nn.Conv2d(out_ch, out_ch, 3, padding=1)
+        self.norm1 = nn.GroupNorm(min(8, in_ch), in_ch)
+        self.norm2 = nn.GroupNorm(min(8, out_ch), out_ch)
+        self.act = nn.SiLU()
+
+        self.skip = nn.Conv2d(in_ch, out_ch, 1) if in_ch != out_ch else nn.Identity()
+
+    def forward(self, x, t_emb, text_emb=None):
+        h = self.act(self.norm1(x))
+        h = self.conv1(h)
+
+        # Add time embedding
+        h = h + self.time_mlp(t_emb)[:, :, None, None]
+
+        # Add text embedding
+        if self.text_mlp is not None and text_emb is not None:
+            h = h + self.text_mlp(text_emb)[:, :, None, None]
+
+        h = self.act(self.norm2(h))
+        h = self.conv2(h)
+
+        return h + self.skip(x)
+
+
+class TextConditionedUNet(nn.Module):
+    """U-Net with CLIP text conditioning."""
+
+    def __init__(self, text_dim=512):
+        super().__init__()
+        self.text_dim = text_dim
+
+        self.time_emb = TimeEmbedding(config.TIME_DIM)
+        self.time_mlp = nn.Sequential(
+            nn.Linear(config.TIME_DIM, config.TIME_DIM),
+            nn.SiLU(),
+            nn.Linear(config.TIME_DIM, config.TIME_DIM)
+        )
+
+        self.text_proj = nn.Sequential(
+            nn.Linear(text_dim, text_dim),
+            nn.SiLU(),
+            nn.Linear(text_dim, text_dim)
+        )
+
+        # Down path
+        self.down1 = ResBlock(1, config.CHANNELS, config.TIME_DIM, text_dim)
+        self.down2 = ResBlock(config.CHANNELS, config.CHANNELS * 2, config.TIME_DIM, text_dim)
+        self.down3 = ResBlock(config.CHANNELS * 2, config.CHANNELS * 4, config.TIME_DIM, text_dim)
+
+        # Middle
+        self.mid = ResBlock(config.CHANNELS * 4, config.CHANNELS * 4, config.TIME_DIM, text_dim)
+
+        # Up path
+        self.up3 = ResBlock(config.CHANNELS * 8, config.CHANNELS * 2, config.TIME_DIM, text_dim)
+        self.up2 = ResBlock(config.CHANNELS * 4, config.CHANNELS, config.TIME_DIM, text_dim)
+        self.up1 = ResBlock(config.CHANNELS * 2, config.CHANNELS, config.TIME_DIM, text_dim)
+
+        # Output
+        self.out = nn.Conv2d(config.CHANNELS, 1, 1)
+
+        # Pooling/Upsampling
+        self.pool = nn.MaxPool2d(2)
+        self.upsample = nn.Upsample(scale_factor=2, mode='nearest')
+
+    def forward(self, x, t, text_emb):
+        """
+        Args:
+            x: [B, 1, H, W] noisy images
+            t: [B] timesteps
+            text_emb: [B, text_dim] CLIP text embeddings
+        """
+        # Embeddings
+        t_emb = self.time_mlp(self.time_emb(t))
+        text_emb = self.text_proj(text_emb)
+
+        # Down
+        h1 = self.down1(x, t_emb, text_emb)
+        h2 = self.down2(self.pool(h1), t_emb, text_emb)
+        h3 = self.down3(self.pool(h2), t_emb, text_emb)
+
+        # Middle
+        h = self.mid(self.pool(h3), t_emb, text_emb)
+
+        # Up
+        h = self.up3(torch.cat([self.upsample(h), h3], dim=1), t_emb, text_emb)
+        h = self.up2(torch.cat([self.upsample(h), h2], dim=1), t_emb, text_emb)
+        h = self.up1(torch.cat([self.upsample(h), h1], dim=1), t_emb, text_emb)
+
+        return self.out(h)
+
+def p_sample_text(self, model, x, t, text_embeddings, guidance_scale=1.0):
+        """Sample x_{t-1} from x_t using the model with text conditioning and CFG.
+
+        Args:
+            model: The diffusion model
+            x: Current noisy image
+            t: Current timestep
+            text_embeddings: Text embeddings for conditioning
+            guidance_scale: Classifier-free guidance scale (1.0 = no guidance, higher = stronger)
+        """
+        predicted_noise = model(x, t, text_embeddings)
+
+        if guidance_scale > 1.0:
+            # Also get unconditional prediction (with zero text embeddings)
+            uncond_embeddings = torch.zeros_like(text_embeddings)
+            uncond_noise = model(x, t, uncond_embeddings)
+
+            # Amplify the difference between conditional and unconditional
+            predicted_noise = uncond_noise + guidance_scale * (predicted_noise - uncond_noise)
+
+        betas_t = extract(self.betas, t, x.shape)
+        sqrt_one_minus_alphas_cumprod_t = extract(
+            self.sqrt_one_minus_alphas_cumprod, t, x.shape
+        )
+        sqrt_recip_alphas_t = extract(1.0 / torch.sqrt(self.alphas), t, x.shape)
+
+        model_mean = sqrt_recip_alphas_t * (
+            x - betas_t * predicted_noise / sqrt_one_minus_alphas_cumprod_t
+        )
+
+        if t[0] == 0:
+            return model_mean
+        else:
+            posterior_variance_t = extract(self.posterior_variance, t, x.shape)
+            noise = torch.randn_like(x)
+            return model_mean + torch.sqrt(posterior_variance_t) * noise
+
+    def sample_text(self, model, shape, text_embeddings, device="cuda", guidance_scale=1.0):
+        """Generate samples using DDPM sampling with text conditioning and CFG.
+
+        Args:
+            model: The diffusion model
+            shape: Output shape (B, C, H, W)
+            text_embeddings: Text embeddings for conditioning
+            device: Device to use
+            guidance_scale: Classifier-free guidance scale (1.0 = no guidance, 3.0-7.0 typical)
+        """
+        b = shape[0]
+        img = torch.randn(shape, device=device)
+
+        for i in reversed(range(0, self.num_timesteps)):
+            t = torch.full((b,), i, device=device, dtype=torch.long)
+            img = self.p_sample_text(model, img, t, text_embeddings, guidance_scale)
+
+            img = torch.clamp(img, -2.0, 2.0)
+
+        return img
